@@ -1,0 +1,13 @@
+# virtual environment
+.venv/
+
+# python
+__pycache__/
+*.pyc
+
+# data
+data/*
+!data/**/.gitkeep
+
+# env
+.env
