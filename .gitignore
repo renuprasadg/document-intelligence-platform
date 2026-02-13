@@ -11,3 +11,8 @@ data/*
 
 # env
 .env
+
+# Packaging artifacts
+*.egg-info/
+dist/
+build/
