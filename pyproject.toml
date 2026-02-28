@@ -1,23 +1,58 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "document-intelligence-platform"
+name = "knowledge-engine"
 version = "0.1.0"
-description = "Knowledge Engine for grounded document reasoning"
-authors = [{ name = "Your Name" }]
-readme = "README.md"
-requires-python = ">=3.10"
+description = "Production RAG system for insurance policy Q&A"
+authors = [{name = "Renu Prasad", email = "renuprasadg@example.com"}]
+requires-python = ">=3.11"
 
 dependencies = [
-    "tiktoken",
-    "fastapi",
-    "uvicorn",
+    # Core
+    "fastapi>=0.109.0",
+    "uvicorn[standard]>=0.27.0",
+    "pydantic>=2.5.0",
+    "pydantic-settings>=2.1.0",
+    
+    # AI/ML
+    "openai>=1.10.0",
+    "chromadb>=0.4.22",
+    "sentence-transformers>=2.3.0",
+    "tiktoken>=0.5.2",
+    
+    # Document Processing
+    "pymupdf>=1.23.0",
+    
+    # Utils
+    "python-dotenv>=1.0.0",
 ]
 
-[tool.setuptools]
-package-dir = {"" = "src"}
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.4",
+    "pytest-cov>=4.1.0",
+    "pytest-asyncio>=0.21.0",
+    "httpx>=0.26.0",
+    "black>=23.12.0",
+    "ruff>=0.1.9",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+
+[tool.black]
+line-length = 100
+target-version = ['py311']
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
