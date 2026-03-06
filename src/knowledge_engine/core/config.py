@@ -1,8 +1,12 @@
 """
-Application configuration using Pydantic Settings
+Application configuration using Pydantic Settings with factory pattern
 """
-from pydantic_settings import BaseSettings
+from functools import lru_cache
+from pathlib import Path
+from typing import Optional
+
 from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -30,10 +34,38 @@ class Settings(BaseSettings):
     CHUNK_SIZE: int = 512
     CHUNK_OVERLAP: int = 50
     
-    class Config:
-        env_file = ".env"
-        case_sensitive = True
+    # Pricing Configuration
+    PRICING_CONFIG_PATH: str = "./configs/pricing.yaml"
+    
+    # Pydantic v2 config
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        case_sensitive=True,
+        extra="ignore"
+    )
 
 
-# Global settings instance
-settings = Settings()
+@lru_cache()
+def get_settings() -> Settings:
+    """
+    Factory function to get settings instance (cached)
+    
+    This pattern avoids import-time crashes if .env is missing
+    and makes testing easier (can clear cache and reload)
+    
+    Returns:
+        Settings instance
+        
+    Examples:
+        >>> from knowledge_engine.core.config import get_settings
+        >>> settings = get_settings()
+        >>> print(settings.APP_NAME)
+        GuardianRAG
+    """
+    return Settings()
+
+
+# For convenience in tests - allows clearing cache
+def reset_settings_cache():
+    """Clear settings cache (useful for testing)"""
+    get_settings.cache_clear()
