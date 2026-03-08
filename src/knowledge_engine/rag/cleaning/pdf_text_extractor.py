@@ -1,262 +1,182 @@
-from __future__ import annotations
-
-from dataclasses import dataclass
+"""
+PDF text extraction using PyMuPDF (Enterprise Edition)
+ 
+Requires: pip install PyMuPDF
+ 
+Features:
+  - Per-page extraction with page metadata
+  - Scanned PDF detection (image-only PDFs)
+  - Automatic normalization via TextNormalizer
+  - Configurable extraction flags
+"""
+from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
-from typing import Iterable
-
-import fitz  # PyMuPDF
-import logging
-import re
-
-logger = logging.getLogger(__name__)
-
-
-# ----------------------------
-# Config
-# ----------------------------
-
-@dataclass(frozen=True)
-class CleanConfig:
-    header_scan_lines: int = 10
-    footer_scan_lines: int = 3
-    # Keep this list small and general; project-specific patterns can be added later.
-    header_footer_exact: tuple[str, ...] = (
-        "Financial Conduct Authority",
-        "FG22/5",
-    )
-    header_footer_prefixes: tuple[str, ...] = (
-        "FG22/5 Final non-Handbook Guidance",
-        "Chapter",
-    )
-
-
-# ----------------------------
-# Helpers
-# ----------------------------
-
-def is_header_or_footer(line: str, cfg: CleanConfig) -> bool:
-    s = line.strip()
-    if not s:
-        return False
-
-    # page numbers like "1", "12", "103"
-    if s.isdigit() and len(s) <= 3:
-        return True
-
-    if s in cfg.header_footer_exact:
-        return True
-
-    s_lower = s.lower()
-    for pref in cfg.header_footer_prefixes:
-        # allow case-insensitive match for "chapter"
-        if pref.lower() == "chapter":
-            if s_lower.startswith("chapter"):
-                return True
-        else:
-            if s.startswith(pref):
-                return True
-
-    return False
-
-
-# ----------------------------
-# Core cleaning steps
-# ----------------------------
-
-def clean_page_text(text: str) -> str:
-    """Normalize line endings/tabs and collapse repeated blank lines."""
-    logger.debug("Cleaning page text: %d chars in", len(text))
-
-    cleaned = text.replace("\r\n", "\n").replace("\r", "\n").replace("\t", " ")
-
-    # per-line trim (keep left spacing; PDFs sometimes indent intentionally)
-    lines = [ln.rstrip() for ln in cleaned.split("\n")]
-    cleaned = "\n".join(lines)
-
-    # collapse multiple blank lines to max 1 blank line
-    out_lines: list[str] = []
-    prev_blank = False
-    for line in cleaned.split("\n"):
-        is_blank = (line.strip() == "")
-        if is_blank and prev_blank:
-            continue
-        out_lines.append(line)
-        prev_blank = is_blank
-
-    cleaned = "\n".join(out_lines)
-
-    logger.debug("Cleaning page text: %d chars out", len(cleaned))
-    return cleaned
-
-
-def remove_headers_footers(text: str, cfg: CleanConfig) -> str:
-    """Remove likely header/footer lines from top/bottom of each page."""
-    lines = text.split("\n")
-    new_lines: list[str] = []
-
-    for i, line in enumerate(lines):
-        if i < cfg.header_scan_lines and is_header_or_footer(line, cfg):
-            continue
-        if i >= len(lines) - cfg.footer_scan_lines and is_header_or_footer(line, cfg):
-            continue
-        new_lines.append(line)
-
-    return "\n".join(new_lines)
-
-
-def join_wrapped_lines(text: str) -> str:
+from typing import Dict, List, Optional
+ 
+try:
+    import fitz  # PyMuPDF
+except ImportError as e:
+    raise ImportError(
+        "PyMuPDF is required: pip install PyMuPDF"
+    ) from e
+ 
+from knowledge_engine.rag.cleaning.text_normalizer import get_text_normalizer
+from knowledge_engine.core.exceptions import DocumentProcessingError
+from knowledge_engine.core.logging_config import get_logger
+ 
+logger = get_logger(__name__)
+ 
+ 
+@dataclass
+class PageData:
+    """Data extracted from a single PDF page"""
+    page_number: int           # 1-indexed
+    raw_text: str
+    normalized_text: str
+    char_count: int = 0
+    word_count: int = 0
+    is_empty: bool = False
+ 
+    def __post_init__(self):
+        self.char_count = len(self.normalized_text)
+        self.word_count = len(self.normalized_text.split())
+        self.is_empty = self.word_count == 0
+ 
+ 
+@dataclass
+class ExtractionResult:
+    """Result of a full PDF extraction"""
+    filepath: str
+    pages: List[PageData] = field(default_factory=list)
+    total_pages: int = 0
+    empty_pages: int = 0
+    is_scanned: bool = False
+    extraction_error: Optional[str] = None
+ 
+    @property
+    def full_text(self) -> str:
+        """Combined text from all pages, separated by form-feed."""
+        return "\x0c".join(p.normalized_text for p in self.pages)
+ 
+    @property
+    def succeeded(self) -> bool:
+        return self.extraction_error is None
+ 
+    @property
+    def total_words(self) -> int:
+        return sum(p.word_count for p in self.pages)
+ 
+ 
+@dataclass
+class ExtractorConfig:
+    """Configuration for PDFTextExtractor"""
+    # PyMuPDF text extraction flags
+    # TEXT_PRESERVE_LIGATURES=1, TEXT_PRESERVE_WHITESPACE=2
+    # TEXT_PRESERVE_SPANS=4, TEXT_INHIBIT_SPACES=8
+    flags: int = 0
+    normalize_text: bool = True
+    # Scanned detection: if >= this fraction of pages have fewer than
+    # min_page_words words, the PDF likely has no text layer (image-only).
+    scanned_page_fraction: float = 0.7   # 70% near-empty pages = scanned
+    min_page_words: int = 5              # Pages with fewer words = "empty"
+ 
+ 
+class PDFTextExtractor:
     """
-    Join PDF-wrapped lines into paragraphs while preserving:
-    - blank lines (paragraph breaks)
-    - bullets
-    - headings/section numbers
-    - lines ending with sentence punctuation
-    Also fixes simple hyphenation at line breaks: 'informa-\\ntion' -> 'information'
+    Extracts text from PDF files using PyMuPDF.
+ 
+    Usage:
+        extractor = get_pdf_extractor()
+        result = extractor.extract("path/to/document.pdf")
+        if result.is_scanned:
+            logger.warning("PDF appears to be scanned - no text layer")
+        text = result.full_text
     """
-    punct_end = (".", "!", "?", ";", ":", "”", '"', "’", "'")
-    bullet_prefixes = ("•", "-", "*", "–", "—")
-    section_re = re.compile(r"^\d+(\.\d+)*$")
-
-    lines = text.split("\n")
-    out: list[str] = []
-    i = 0
-
-    def is_bullet(line: str) -> bool:
-        s = line.lstrip()
-        return s.startswith(bullet_prefixes)
-
-    def is_section_marker(line: str) -> bool:
-        s = line.strip()
-        return bool(section_re.match(s))
-
-    while i < len(lines):
-        cur = lines[i]
-        cur_s = cur.strip()
-
-        if cur_s == "":
-            out.append("")
-            i += 1
-            continue
-
-        if i == len(lines) - 1:
-            out.append(cur.rstrip())
-            break
-
-        nxt = lines[i + 1]
-        nxt_s = nxt.strip()
-
-        if nxt_s == "":
-            out.append(cur.rstrip())
-            i += 1
-            continue
-
-        if is_bullet(cur) or is_bullet(nxt):
-            out.append(cur.rstrip())
-            i += 1
-            continue
-
-        if is_section_marker(cur) or is_section_marker(nxt):
-            out.append(cur.rstrip())
-            i += 1
-            continue
-
-        if len(cur_s) <= 40 and cur_s.istitle():
-            out.append(cur.rstrip())
-            i += 1
-            continue
-
-        if cur.rstrip().endswith(punct_end):
-            out.append(cur.rstrip())
-            i += 1
-            continue
-
-        # hyphenation: "informa-" + "tion" => "information"
-        if cur.rstrip().endswith("-") and nxt_s and nxt_s[0].islower():
-            merged = cur.rstrip()[:-1] + nxt.lstrip()
-            out.append(merged)
-            i += 2
-            continue
-
-        # join if next line continues a sentence
-        if nxt_s and nxt_s[0].islower():
-            merged = cur.rstrip() + " " + nxt.lstrip()
-            out.append(merged)
-            i += 2
-            continue
-
-        out.append(cur.rstrip())
-        i += 1
-
-    return "\n".join(out)
-
-
-# ----------------------------
-# PDF extraction + pipeline wrapper
-# ----------------------------
-
-def load_pdf_text_by_page(pdf_path: str | Path) -> list[str]:
-    path = Path(pdf_path)
-    logger.info("Loading PDF: %s", path)
-
-    if not path.is_file():
-        raise FileNotFoundError(f"PDF not found: {path.resolve()}")
-
-    if path.suffix.lower() != ".pdf":
-        raise ValueError(f"Expected a .pdf file but got: {path.name}")
-
-    if path.stat().st_size == 0:
-        raise ValueError(f"PDF is empty: {path.resolve()}")
-
-    pages: list[str] = []  # IMPORTANT: define before try (fixes your finally bug)
-    pdf = None
-
-    try:
-        pdf = fitz.open(path)
-        logger.info("PDF opened successfully with %d pages", len(pdf))
-
-        for i in range(len(pdf)):
-            text = pdf[i].get_text()
-            logger.debug("Extracting page %d (%d chars)", i + 1, len(text))
-            pages.append(text)
-
-        return pages
-
-    finally:
-        if pdf is not None:
-            pdf.close()
-        logger.info("Completed extraction: %d pages", len(pages))
-
-
-def clean_pdf_to_pages(pdf_path: str | Path, cfg: CleanConfig | None = None) -> list[str]:
-    """Full pipeline: extract -> normalize -> header/footer -> wrap-join."""
-    if cfg is None:
-        cfg = CleanConfig()
-
-    raw_pages = load_pdf_text_by_page(pdf_path)
-    cleaned_pages: list[str] = []
-
-    for raw in raw_pages:
-        safe = clean_page_text(raw)
-        struct = remove_headers_footers(safe, cfg)
-        final = join_wrapped_lines(struct)
-        cleaned_pages.append(final)
-
-    return cleaned_pages
-
-
-def save_cleaned_pages_as_text(pages: Iterable[str], output_path: str | Path) -> Path:
-    """
-    Save cleaned pages into a single text file with clear page separators.
-    Good for Week-1; later you can save JSON with metadata.
-    """
-    out_path = Path(output_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    with out_path.open("w", encoding="utf-8") as f:
-        for idx, page in enumerate(pages, start=1):
-            f.write(f"\n\n===== PAGE {idx} =====\n\n")
-            f.write(page.strip())
-            f.write("\n")
-
-    logger.info("Saved cleaned output to: %s", out_path.resolve())
-    return out_path
+ 
+    def __init__(self, config: Optional[ExtractorConfig] = None):
+        self.config = config or ExtractorConfig()
+        self._normalizer = get_text_normalizer() if config is None else None
+ 
+    def extract(self, filepath: str) -> ExtractionResult:
+        """
+        Extract text from a PDF file.
+ 
+        Args:
+            filepath: Path to the PDF file
+ 
+        Returns:
+            ExtractionResult with per-page data and full text
+ 
+        Raises:
+            DocumentProcessingError: If PDF cannot be opened
+        """
+        path = Path(filepath)
+        if not path.exists():
+            raise DocumentProcessingError(f"File not found: {filepath}")
+        if path.suffix.lower() != ".pdf":
+            raise DocumentProcessingError(f"Not a PDF file: {filepath}")
+ 
+        try:
+            return self._extract_pages(filepath)
+        except DocumentProcessingError:
+            raise
+        except Exception as e:
+            logger.error("PDF extraction failed for %s: %s", filepath, e)
+            return ExtractionResult(
+                filepath=filepath,
+                extraction_error=str(e),
+            )
+ 
+    def _extract_pages(self, filepath: str) -> ExtractionResult:
+        """Internal: open PDF and extract per-page data."""
+        normalizer = self._normalizer or get_text_normalizer()
+        pages: List[PageData] = []
+ 
+        with fitz.open(filepath) as doc:
+            total_pages = len(doc)
+            logger.info("Extracting %d pages from %s", total_pages, filepath)
+ 
+            for page_num in range(total_pages):
+                page = doc[page_num]
+                raw_text = page.get_text(flags=self.config.flags)
+ 
+                if self.config.normalize_text:
+                    norm_result = normalizer.normalize(raw_text)
+                    normalized = norm_result.normalized_text
+                else:
+                    normalized = raw_text
+ 
+                page_data = PageData(
+                    page_number=page_num + 1,
+                    raw_text=raw_text,
+                    normalized_text=normalized,
+                )
+                pages.append(page_data)
+ 
+        # A page is "empty" if it has fewer than min_page_words words.
+        # If 70%+ of pages are empty, the PDF is likely scanned (no text layer).
+        empty_pages = sum(
+            1 for p in pages if p.word_count < self.config.min_page_words
+        )
+        is_scanned = (
+            total_pages > 0
+            and (empty_pages / total_pages) >= self.config.scanned_page_fraction
+        )
+ 
+        if is_scanned:
+            logger.warning("PDF appears to be scanned (no text layer): %s", filepath)
+ 
+        return ExtractionResult(
+            filepath=filepath,
+            pages=pages,
+            total_pages=total_pages,
+            empty_pages=empty_pages,
+            is_scanned=is_scanned,
+        )
+ 
+ 
+@lru_cache(maxsize=1)
+def get_pdf_extractor() -> PDFTextExtractor:
+    """Factory function - returns cached PDFTextExtractor."""
+    return PDFTextExtractor()

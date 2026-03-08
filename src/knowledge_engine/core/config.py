@@ -19,7 +19,8 @@ class Settings(BaseSettings):
     ENVIRONMENT: str = "development"
     
     # OpenAI Configuration
-    OPENAI_API_KEY: str = Field(..., description="OpenAI API Key")
+    #OPENAI_API_KEY: str = Field(..., description="OpenAI API Key")
+    OPENAI_API_KEY: str | None = None
     EMBEDDING_MODEL: str = "text-embedding-3-small"
     LLM_MODEL: str = "gpt-4"
     TEMPERATURE: float = 0.0
