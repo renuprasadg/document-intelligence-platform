@@ -22,7 +22,7 @@ env/
 data/*
 !data/.gitkeep
 !data/*/.gitkeep
-
+cleaned/
 # IDE
 .vscode/
 .idea/
